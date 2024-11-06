@@ -2,18 +2,20 @@ import os
 import re
 import json
 import torch
+import librosa
 import soundfile
+import torchaudio
 import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
+import torch
 import warnings
-import time
 
 import utils
+import commons
+from models import SynthesizerTrn
 from split_utils import split_sentence
-from sophon import sail
-
-from engine import Engine
+from download_utils import load_or_download_model
 
 
 LANG_TO_HF_REPO_ID = {
@@ -39,6 +41,8 @@ class TTS(nn.Module):
             device = 'cpu'
             if torch.cuda.is_available(): device = 'cuda'
             if torch.backends.mps.is_available(): device = 'mps'
+        if 'cuda' in device:
+            assert torch.cuda.is_available()
 
         # config_path = 
         if config_path is None:
@@ -51,24 +55,29 @@ class TTS(nn.Module):
         num_tones = hps.num_tones
         symbols = hps.symbols
 
+        model = SynthesizerTrn(
+            len(symbols),
+            hps.data.filter_length // 2 + 1,
+            hps.train.segment_size // hps.data.hop_length,
+            n_speakers=hps.data.n_speakers,
+            num_tones=num_tones,
+            num_languages=num_languages,
+            **hps.model,
+        ).to(device)
+
+        model.eval()
+        self.model = model
         self.symbol_to_id = {s: i for i, s in enumerate(symbols)}
         self.hps = hps
         self.device = device
     
+        # load state_dict
+        checkpoint_dict = load_or_download_model(language, device, use_hf=use_hf, ckpt_path=ckpt_path)
+        self.model.load_state_dict(checkpoint_dict['model'], strict=True)
         # bmodel infer
         
         language = language.split('_')[0]
         self.language = 'ZH_MIX_EN' if language == 'ZH' else language # we support a ZH_MIX_EN model
-
-        # option = onnxruntime.SessionOptions()
-        # option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
-        # option.intra_op_num_threads = 1
-        # melo_onnx = "/home/yfchen/workspace/models/sherpa-onnx/vits-melo-tts-zh_en/model.onnx"
-        # self.melo_session = onnxruntime.InferenceSession(melo_onnx, sess_options=option, providers=["CPUExecutionProvider"])
-        melo_bmodel = "../bmodels/vits-melo-tts_1688_f16.bmodel" # "../bmodels/vits-melo-tts_1684x_f32.bmodel" # 
-        # self.melo_infer = SGInfer(melo_bmodel, 1, [0])
-        self.melo_infer = Engine(melo_bmodel, device_id=0, graph_id=0, mode=sail.IOMode.SYSIO)
-        utils.init_jieba("开始", self.language)
 
     @staticmethod
     def audio_numpy_concat(segment_data_list, sr, speed=1.):
@@ -89,10 +98,8 @@ class TTS(nn.Module):
         return texts
 
     def tts_to_file(self, text, speaker_id, output_path=None, sdp_ratio=0.2, noise_scale=0.6, noise_scale_w=0.8, speed=1.0, pbar=None, format=None, position=None, quiet=False,):
-        pipeline_st = time.time()
-        st_time = time.time()
         language = self.language
-        texts = self.split_sentences_into_pieces(text, language, quiet) # 将文本按指定语言分割成句子
+        texts = self.split_sentences_into_pieces(text, language, quiet)
         audio_list = []
         if pbar:
             tx = pbar(texts)
@@ -103,15 +110,11 @@ class TTS(nn.Module):
                 tx = texts
             else:
                 tx = tqdm(texts)
-        print("split cost time: ", time.time()-st_time)
-        indx = 0
         for t in tx:
-            st_time = time.time()
             if language in ['EN', 'ZH_MIX_EN']:
-                t = re.sub(r'([a-z])([A-Z])', r'\1 \2', t) # 将字符串 t 中的小写字母后面紧跟的大写字母之间插入一个空格
+                t = re.sub(r'([a-z])([A-Z])', r'\1 \2', t)
             device = self.device
             bert, ja_bert, phones, tones, lang_ids = utils.get_text_for_tts_infer(t, language, self.hps, device, self.symbol_to_id)
-            
             with torch.no_grad():
                 x_tst = phones.to(device).unsqueeze(0)
                 tones = tones.to(device).unsqueeze(0)
@@ -121,60 +124,24 @@ class TTS(nn.Module):
                 x_tst_lengths = torch.LongTensor([phones.size(0)]).to(device)
                 del phones
                 speakers = torch.LongTensor([speaker_id]).to(device)
-                print("preprocess cost time: ", time.time() - st_time)
-                st_time = time.time()
-                onnx_input = {
-                    'x' : x_tst.detach().numpy(),
-                    'x_lengths' : x_tst_lengths.detach().numpy(),
-                    'tones' : tones.detach().numpy(),
-                    'sid' : speakers.detach().numpy(),
-                    'noise_scale' : torch.tensor([noise_scale], dtype=torch.float32).detach().numpy(),
-                    'length_scale' : torch.tensor([1. / speed], dtype=torch.float32).detach().numpy(),
-                    'noise_scale_w' : torch.tensor([noise_scale_w], dtype=torch.float32).detach().numpy(),
-                }
-                # print(f"x: {x_tst.shape}")
-
-                # audio = self.melo_session.run(None, onnx_input)[0][0, 0]
-
-                """
-                bmodel_inputs = (
-                    onnx_input['x'].astype(nptype(self.melo_infer.get_input_info()["x"]["dtype"])),
-                    onnx_input['x_lengths'].astype(nptype(self.melo_infer.get_input_info()["x_lengths"]["dtype"])),
-                    onnx_input['tones'].astype(nptype(self.melo_infer.get_input_info()["tones"]["dtype"])),
-                    onnx_input['sid'].astype(nptype(self.melo_infer.get_input_info()["sid"]["dtype"])),
-                    onnx_input['noise_scale'].astype(nptype(self.melo_infer.get_input_info()["noise_scale"]["dtype"])),
-                    onnx_input['length_scale'].astype(nptype(self.melo_infer.get_input_info()["length_scale"]["dtype"])),
-                    onnx_input['noise_scale_w'].astype(nptype(self.melo_infer.get_input_info()["noise_scale_w"]["dtype"])),
-                )
-                _ = self.melo_infer.put(*bmodel_inputs)
-                _, bmodel_outputs, _ = self.melo_infer.get()
-                """
-                bmodel_inputs = (
-                    onnx_input['x'],
-                    onnx_input['x_lengths'],
-                    onnx_input['tones'],
-                    onnx_input['sid'],
-                    onnx_input['noise_scale'],
-                    onnx_input['length_scale'],
-                    onnx_input['noise_scale_w'],
-                )
-                print("engine infer init cost time: ", time.time() - st_time)
-                bmodel_outputs = self.melo_infer(bmodel_inputs)
-                print("engine infer cost time: ", time.time() - st_time)
-                bmodel_outputs[0] = torch.from_numpy(bmodel_outputs[0])
-                audio = bmodel_outputs[0].squeeze((0, 1))
-
+                audio = self.model.infer(
+                        x_tst,
+                        x_tst_lengths,
+                        speakers,
+                        tones,
+                        lang_ids,
+                        bert,
+                        ja_bert,
+                        sdp_ratio=sdp_ratio,
+                        noise_scale=noise_scale,
+                        noise_scale_w=noise_scale_w,
+                        length_scale=1. / speed,
+                    )[0][0, 0].data.cpu().float().numpy()
                 del x_tst, tones, lang_ids, bert, ja_bert, x_tst_lengths, speakers
-                # import pdb; pdb.set_trace()
                 # 
             audio_list.append(audio)
-            # soundfile.write("test_output/{}.wav".format(indx), audio, self.hps.data.sampling_rate)
-            indx += 1
-            print("infer cost time: ", time.time() - st_time)
-        st_time = time.time()
         torch.cuda.empty_cache()
         audio = self.audio_numpy_concat(audio_list, sr=self.hps.data.sampling_rate, speed=speed)
-        print("pipeline cost: ", time.time() - pipeline_st)
 
         if output_path is None:
             return audio
@@ -183,13 +150,9 @@ class TTS(nn.Module):
                 soundfile.write(output_path, audio, self.hps.data.sampling_rate, format=format)
             else:
                 soundfile.write(output_path, audio, self.hps.data.sampling_rate)
-        print("write file cost time: ", time.time() - st_time)
 
 
 if __name__ =="__main__":
-    print("init start ...")
-    import nltk
-    nltk.download('averaged_perceptron_tagger_eng')
     text = "2023年至今，Deep Learning 正在飞速发展，在N-L-P领域，以Chat G-P-T为代表的L-L-M模型对长文本的理解有了巨大的提升，使得A-I具有了深度思考的能力。A-I-G-C领域也迎来了爆发，诞生了处理Text-to-Image、Image-to-Image任务的Stable-Difusion、S-D-X-L、ControlNet模型，以及文生视频的Sora模型。"
     output_path = "./test_output/zh.wav"
     file = False # help="Text is a file"
@@ -210,7 +173,7 @@ if __name__ =="__main__":
     if speaker == '': speaker = None
     if (not language == 'EN') and speaker:
         warnings.warn('You specified a speaker but the language is English.')
-    # from melo.api import TTS
+    from melo.api import TTS
     model = TTS(language=language, device=device)
     speaker_ids = model.hps.data.spk2id
     if language == 'EN':
@@ -218,5 +181,4 @@ if __name__ =="__main__":
         spkr = speaker_ids[speaker]
     else:
         spkr = speaker_ids[list(speaker_ids.keys())[0]]
-    print("init end ...")
     model.tts_to_file(text, spkr, output_path, speed=speed)

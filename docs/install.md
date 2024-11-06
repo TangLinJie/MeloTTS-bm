@@ -13,6 +13,8 @@ The repo is developed and tested on `Ubuntu 20.04` and `Python 3.9`.
 ```bash
 git clone https://github.com/myshell-ai/MeloTTS.git
 cd MeloTTS
+export HF_ENDPOINT=https://hf-mirror.com
+sudo apt-get install libsndfile1
 pip install -e .
 python -m unidic download
 ```
